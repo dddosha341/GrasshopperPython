@@ -19,7 +19,13 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 from kuznyechik.kuznyechik import Kuznyechik
-from kuznyechik.modes import ecb_decrypt, ecb_encrypt
+from kuznyechik.modes import (
+    ecb_decrypt,
+    ecb_encrypt,
+    ecb_decrypt_parallel,
+    ecb_encrypt_parallel,
+    PARALLEL_THRESHOLD,
+)
 
 
 def run_encrypt(path_in: str) -> None:
@@ -30,8 +36,11 @@ def run_encrypt(path_in: str) -> None:
     with open(path_in, "rb") as f:
         plaintext = f.read()
     key = os.urandom(32)
-    cipher = Kuznyechik(key, use_matrix_l=False)
-    ciphertext = ecb_encrypt(cipher, plaintext, pad=True)
+    if len(plaintext) >= PARALLEL_THRESHOLD:
+        ciphertext = ecb_encrypt_parallel(key, plaintext, pad=True)
+    else:
+        cipher = Kuznyechik(key, use_mi_tables=True)
+        ciphertext = ecb_encrypt(cipher, plaintext, pad=True)
     path_out = path_in + ".kuznyechik"
     with open(path_out, "w", encoding="utf-8") as f:
         f.write(f"key: {key.hex()}\n")
@@ -133,9 +142,12 @@ def main() -> None:
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
     key, ciphertext = parse_kuznyechik_file(path)
-    cipher = Kuznyechik(key, use_matrix_l=False)
     t_start = time.perf_counter()
-    plaintext = ecb_decrypt(cipher, ciphertext, unpad=True)
+    if len(ciphertext) >= PARALLEL_THRESHOLD:
+        plaintext = ecb_decrypt_parallel(key, ciphertext, unpad=True)
+    else:
+        cipher = Kuznyechik(key, use_mi_tables=True)
+        plaintext = ecb_decrypt(cipher, ciphertext, unpad=True)
     t_end = time.perf_counter()
     size_bytes = len(plaintext)
     time_sec = t_end - t_start

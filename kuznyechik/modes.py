@@ -1,12 +1,18 @@
 """
 Режимы работы блочного шифра по ГОСТ 34.13-2015.
 ECB, CBC, OFB, CFB, CTR. Дополнение по процедуре 1.
+Параллельные ECB через ProcessPoolExecutor для больших объёмов.
 """
 
+from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Optional
 import os
 
 from .kuznyechik import Kuznyechik, BLOCK_SIZE
+
+# Размер чанка для параллельного ECB (должен быть кратен 16)
+DEFAULT_CHUNK_SIZE = 1 << 20  # 1 МБ
+PARALLEL_THRESHOLD = 256 * 1024  # 256 КБ — порог для включения параллелизма
 
 BlockCipher = Callable[[bytearray], None]
 
@@ -65,6 +71,85 @@ def ecb_decrypt(cipher: Kuznyechik, data: bytes, unpad: bool = True) -> bytearra
         block = bytearray(data[i : i + BLOCK_SIZE])
         _block_decrypt(cipher, block)
         result[i : i + BLOCK_SIZE] = block
+    if unpad:
+        result = unpad_procedure1(result)
+    return result
+
+
+def _ecb_chunk_worker(args: tuple) -> bytes:
+    """
+    Воркер для параллельного ECB: (key, chunk, encrypt).
+    Верхнеуровневая функция для pickle при multiprocessing.
+    """
+    key, chunk, encrypt = args
+    cipher = Kuznyechik(key, use_mi_tables=True)
+    result = bytearray(chunk)
+    for i in range(0, len(result), BLOCK_SIZE):
+        block = result[i : i + BLOCK_SIZE]
+        if encrypt:
+            cipher.encrypt_block(block)
+        else:
+            cipher.decrypt_block(block)
+        result[i : i + BLOCK_SIZE] = block
+    return bytes(result)
+
+
+def ecb_encrypt_parallel(
+    key: bytes,
+    data: bytes,
+    pad: bool = True,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_workers: Optional[int] = None,
+) -> bytearray:
+    """Шифрование ECB с разбиением на чанки по процессам (без pad/unpad внутри чанков)."""
+    if pad:
+        data = pad_procedure1(data)
+    else:
+        data = bytearray(data)
+    if len(data) % BLOCK_SIZE != 0:
+        raise ValueError("Data length must be multiple of block size after pad")
+    n_workers = max_workers or os.cpu_count() or 4
+    chunk_size = (chunk_size // BLOCK_SIZE) * BLOCK_SIZE
+    if chunk_size < BLOCK_SIZE:
+        chunk_size = BLOCK_SIZE
+    if len(data) < PARALLEL_THRESHOLD:
+        cipher = Kuznyechik(key, use_mi_tables=True)
+        return ecb_encrypt(cipher, bytes(data), pad=False)
+    chunks = []
+    for start in range(0, len(data), chunk_size):
+        chunks.append(bytes(data[start : start + chunk_size]))
+    n_workers = min(n_workers, len(chunks))
+    tasks = [(key, c, True) for c in chunks]
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_ecb_chunk_worker, tasks))
+    return bytearray(b"".join(results))
+
+
+def ecb_decrypt_parallel(
+    key: bytes,
+    data: bytes,
+    unpad: bool = True,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_workers: Optional[int] = None,
+) -> bytearray:
+    """Дешифрование ECB с разбиением на чанки по процессам."""
+    if len(data) % BLOCK_SIZE != 0:
+        raise ValueError("Data length must be multiple of block size")
+    n_workers = max_workers or os.cpu_count() or 4
+    chunk_size = (chunk_size // BLOCK_SIZE) * BLOCK_SIZE
+    if chunk_size < BLOCK_SIZE:
+        chunk_size = BLOCK_SIZE
+    if len(data) < PARALLEL_THRESHOLD:
+        cipher = Kuznyechik(key, use_mi_tables=True)
+        return ecb_decrypt(cipher, data, unpad=unpad)
+    chunks = []
+    for start in range(0, len(data), chunk_size):
+        chunks.append(data[start : start + chunk_size])
+    n_workers = min(n_workers, len(chunks))
+    tasks = [(key, c, False) for c in chunks]
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(_ecb_chunk_worker, tasks))
+    result = bytearray(b"".join(results))
     if unpad:
         result = unpad_procedure1(result)
     return result
